@@ -62,382 +62,291 @@ defmodule Conform.Translate do
   """
   @spec to_config([{term, term}] | [], [{term, term}] | [], [{term, term}]) :: term
   def to_config(config, conf, schema) do
-    # Convert the .conf into a map of key names to values
-    normalized_conf =
-      for {setting, value} <- conf, into: %{} do
-        key = setting
-              |> Enum.map(&List.to_string/1)
-              |> Enum.join(".")
-              |> String.to_atom
-        {key, value}
-    end
-
     schema = Keyword.delete(schema, :import)
     case schema do
       [mappings: mappings, translations: translations] ->
-        # get complex data types
-        {mappings, complex} = get_complex(mappings, translations, normalized_conf)
-        # Parse the .conf into a map of applications and their settings, applying translations where defined
-        settings = Enum.reduce(mappings, complex,
-          fn {key, mapping}, result ->
-            # Get the datatype for this mapping, falling back to binary if not defined
-            datatype = Keyword.get(mapping, :datatype, :binary)
-            # Get the default value for this mapping, if defined
-            default_value = Keyword.get(mapping, :default, nil)
-            # parsed value returns the value with valid data type
-            parsed_value = case get_in(normalized_conf, [key]) do
-              nil        -> default_value
-              conf_value ->
-                case parse_datatype(datatype, conf_value, key) do
-                  nil ->
-                    conf_value
-                  val -> val
-                end
-            end
+        # Apply mappings/translations
+        conf = transform_conf(conf, mappings, translations)
 
-            # Break the schema key name into it's parts, [app, [key1, key2, ...]]
-            [app_name|setting_path] = Keyword.get(mapping, :to, key |> Atom.to_string)
-                                      |> String.split(".")
-                                      |> Enum.map(&String.to_atom/1)
-
-            # Get the translation function is_function one is defined
-            translated_value = case get_in(translations, [key]) do
-              fun when is_function(fun) ->
-                case :erlang.fun_info(fun, :arity) do
-                  {:arity, 2} ->
-                    fun.(mapping, parsed_value)
-                  {:arity, 3} ->
-                    current_value = get_in(result, [app_name|setting_path])
-                    fun.(mapping, parsed_value, current_value)
-                  _ ->
-                    Conform.Utils.error("Invalid translation function arity for #{key}. Must be /2 or /3")
-                    exit(1)
-                end
-              _ ->
-                # if we have no the translation for the current key
-                # in the schema, maybe we are dealing with a custom
-                # type.
-                case is_custom_type?(datatype) do
-                  {true, mod, _args} ->
-                    translate_custom_type(mod, mapping, key, normalized_conf, parsed_value, result, app_name, setting_path)
-                  _ ->
-                    parsed_value
-                end
-            end
-
-            # Update this application setting, using empty maps as the default
-            # value when working down `setting_path` and complex types
-            res = Enum.map(complex, fn({app, complex_map}) ->
-              case app == app_name do
-                true ->
-                  Enum.reduce(complex_map, result, fn({complex_key, complex_val}, acc) ->
-                    update_in!(acc, [app_name|[complex_key] |> repath], complex_val)
-                  end)
-                false ->
-                  []
-              end
-            end) |> List.flatten
-
-            result = update_in!(result, [app_name|setting_path |> repath], translated_value)
-            result = case res do
-              [] ->
-                result
-              records ->
-                update_in!(records, [app_name|setting_path |> repath], translated_value)
-            end
-            result
-            |> Stream.map(fn {key, value} -> {key, Enum.sort_by(value, fn {k,_} -> k end)} end)
-            |> Enum.sort_by(fn {key, _} -> key end)
-        end)
-
-        # One last pass to catch any config settings not present in the schema, but
-        # which should still be present in the merged configuration
-        merged = config |> Enum.reduce(settings, fn {app, app_config}, acc ->
-          # Ensure this app is present in the merged config
-          acc = case Keyword.has_key?(acc, app) do
-            true  -> acc
-            false -> put_in(acc, [app], [])
-          end
-          # Add missing settings to merged config from config.exs
-          app_config |> Enum.reduce(acc, fn {key, value}, acc ->
-            case get_in(acc, [app, key]) do
-              nil -> put_in(acc, [app, key], value)
-              _   -> acc
-            end
-          end)
-          |> Enum.map(fn
-            {key, value} when is_list(value) ->
-              {key, Enum.sort_by(value, fn {k, _} -> k end)}
-            x ->
-              x
-          end)
-        end)
-
+        # Merge the config.exs/sys.config terms
+        IO.inspect {:config, config}
+        IO.inspect {:conf, conf}
+        merged = merge(config, conf)
+        IO.inspect {:merged, merged}
 
         # Convert config map to Erlang config terms
-        merged |> settings_to_config
+        settings_to_config(merged)
       _ ->
         raise Conform.Schema.SchemaError
     end
   end
 
-  defp get_complex(mappings, translations, normalized_conf) do
-    complex       = get_complex([], mappings)
-    mappings      = delete_complex([], mappings) |> :lists.reverse
-    complex_names = get_complex_names([], complex, normalized_conf)
+  # Merges two sets of Elixir/Erlang terms, where the terms come in the form of lists of tuples.
+  defp merge(old, new) when is_list(old) and is_list(new) do
+    merge(old, new, [])
+  end
 
-    complex = Enum.reduce(complex, [], fn {map_key, mapping}, result ->
-      data = Enum.map(complex_names, fn {complex_data_type, complex_type_name} ->
-        {_, p} = Regex.compile(map_key |> Atom.to_string)
-        case Regex.run(p, complex_data_type) do
-          nil -> []
-          _ ->
-            case mapping do
-              [] ->
-                field         = String.to_atom(complex_type_name)
-                datatype      = get_in(mappings, [map_key, :datatype]) || :binary
-                default_value = get_in(mappings, [map_key, :default])
-                conf_key      = String.to_atom(complex_data_type <> "." <> complex_type_name)
-                case get_in_complex(complex_type_name, normalized_conf, [conf_key]) do
-                  [] -> {field, default_value}
-                  conf_value ->
-                    case parse_datatype(datatype, conf_value, complex_data_type <> "." <> complex_type_name) do
-                      nil -> {field, conf_value}
-                      val -> {field, val}
-                    end
-                end
-              _ ->
-                 data = Enum.map(mapping, fn {complex_key, complex_mappings} ->
-                    field         = String.split(Atom.to_string(complex_key), "*.")
-                                    |> List.last
-                                    |> String.to_atom
-                    datatype      = Keyword.get(complex_mappings, :datatype, :binary)
-                    default_value = Keyword.get(complex_mappings, :default, nil)
+  defp merge([{old_key, old_value} = h | t], new, acc) when is_tuple(h) do
+    case :lists.keytake(elem(h, 0), 1, new) do
+      {:value, {new_key, new_value}, rest} ->
+        IO.inspect {:merge, old_value, new_value, Keyword.keyword?(old_value), Keyword.keyword?(new_value)}
+        # Value is present in new, so merge the value
+        cond do
+          # TODO replace with call to merge_term
+          Keyword.keyword?(old_value) && Keyword.keyword?(new_value) ->
+            merged = merge(old_value, new_value)
+            merge(t, rest, [{new_key, merged}|acc])
+          :io_lib.char_list(old_value) && :io_lib.char_list(new_value) ->
+            merge(t, rest, [{new_key, new_value}|acc])
+          is_list(old_value) && is_list(new_value) ->
 
-                    case get_in_complex(complex_type_name, normalized_conf, [complex_key]) do
-                      []         -> {field, default_value}
-                      conf_value ->
-                      case parse_datatype(datatype, conf_value, complex_key) do
-                        nil -> {field, conf_value}
-                        val -> {field, val}
-                      end
-                    end
-                 end)
-                {complex_data_type, complex_type_name |> String.to_atom, data}
-              end
+          old_value == nil && is_list(new_value) ->
+            merge(t, rest, [{new_key, new_value}|acc])
+          true ->
+            merged = merge_term(h, new_value) |> IO.inspect
+            merge(t, rest, [merged|acc])
+        end
+      false ->
+        # Value doesn't exist in new, so add it
+        merge(t, new, [h|acc])
+    end
+  end
+  defp merge([], new, acc) do
+    Enum.reverse(acc, new)
+  end
+
+  defp merge_term([hold|told], [hnew|tnew] = new) when is_list(new) do
+    [merge_term(hold, hnew) | merge_term(told, tnew)]
+  end
+  defp merge_term([], new) when is_list(new), do: new
+  defp merge_term(old, []) when is_list(old), do: old
+
+  defp merge_term(old, new) when is_tuple(old) and is_tuple(new) do
+    old
+    |> Tuple.to_list
+    |> Enum.with_index
+    |> Enum.reduce([], fn
+        {[], idx}, acc ->
+          [elem(new, idx)|acc]
+        {val, idx}, acc when is_list(val) ->
+          case :io_lib.char_list(val) do
+            true ->
+              [elem(new, idx)|acc]
+            false ->
+              merged = val |> Enum.concat(elem(new, idx)) |> Enum.uniq
+              [merged|acc]
           end
-      end) |> List.flatten
-      data = Enum.reduce(data, result, fn {app_key, wildcard, children}, result when is_list(children) ->
-        app_path = (String.split(app_key, ".") |> Enum.map(&String.to_atom/1)) ++ [wildcard]
-        children = Enum.reduce(children, result, fn {key, value}, acc ->
-          path = String.split(Atom.to_string(key), ".")
-          [parent_key|child_key] = path_key = app_path ++ Enum.map(path, &String.to_atom/1)
-          # Check if the parent even exists, if it does and is a list, we'll put the child inside as a {key, value} tuple.
-          # If the parent does not exist, we'll add it and make it a keyword list value.
-          # If the parent does exist, but is not nil or a list, we'll skip attempting to nest this key, as it's likely the intent was
-          # to keep it as a separate setting.
+        {val, idx}, acc when is_tuple(val) ->
+          [merge_term(val, elem(new, idx))|acc]
+        {_val, idx}, acc ->
+          [elem(new, idx)|acc]
+       end)
+    |> Enum.reverse
+    |> List.to_tuple
+  end
 
-          # We have to make sure the entire path is present, so we reduce over the path adding children as we go
-          put_result = Enum.reduce(path_key, {[], acc, :next}, fn
-            # This is the parent key, just make sure it's a list
-            key_part, {[], acc2, :next} ->
-              current_path = [key_part]
-              case get_in(acc2, current_path) do
-                x when is_list(x) -> {current_path, acc2, :next}
-                nil               -> {current_path, put_in(acc2, current_path, []), :next}
-                _                 -> {current_path, acc2, :halt}
-              end
-            # This is a middle component of the path
-            key_part, {parents, acc2, :next} ->
-              current_path = [key_part|parents]
-              parent_path  = Enum.reverse(parents)
-              case get_in(acc2, Enum.reverse(current_path)) do
-                x when is_list(x) -> {current_path, acc2, :next}
-                nil               -> {current_path, put_in(acc2, Enum.reverse(current_path), []), :next}
-                _                 -> {current_path, acc2, :halt}
-              end
-            # We've hit a non-nil/list value, stop updating this key
-            key_part, {parents, acc2, :halt} ->
-              {parents, acc2, :halt}
-          end)
-
-          case put_result do
-           {_, res, :halt}    -> put_in(res, path_key, value)
-           {put_path, res, _} ->
-             put_in(res, path_key, value) |> Keyword.delete(key)
+  defp transform_conf(conf, mappings, translations) do
+    table_id = :ets.new(:conform_conf, [:set, keypos: 1])
+    try do
+      # Populate table
+      for {key, value} <- conf, do: :ets.insert(table_id, {key, value})
+      # Convert mappings/translations to same key format
+      mappings = Enum.map(mappings, fn {key, mapping} ->
+        new_key     = String.split(Atom.to_string(key), ".") |> Enum.map(&String.to_char_list/1)
+        to          = Keyword.get(mapping, :to, "")
+        new_to      = String.split(to, ".") |> Enum.map(&String.to_char_list/1)
+        {new_key, Keyword.merge(mapping, [to: new_to])}
+      end) |> Enum.sort_by(fn {key, _} -> Enum.count(key) end, fn x, y -> x >= y end)
+      translations = Enum.map(translations, fn {key, translation} ->
+        new_key = String.split(Atom.to_string(key), ".") |> Enum.map(&String.to_char_list/1)
+        {new_key, translation}
+      end)
+      # Apply conversions
+      convert_types(mappings, table_id)
+      # Build complex types
+      convert_complex_types(mappings, table_id)
+      # Apply translations to aggregated values
+      apply_translations(mappings, translations, table_id)
+      # Fetch config from ETS
+      result = :ets.tab2list(table_id)
+      # Sort by longest keys so that we build the config hierarchy from the bottom up
+      result = Enum.sort_by(result, fn {key, _} -> Enum.count(key) end, fn x, y -> x <= y end)
+      # Build config
+      result = Enum.reduce(result, [], fn {key, value}, acc ->
+        key = Enum.map(key, &List.to_atom/1)
+        {acc, _} = List.foldl(key, {acc, []}, fn key_part, {acc, parents} ->
+          current       = [key_part|parents]
+          current_path  = current |> Enum.reverse
+          case get_in(acc, current_path) do
+            nil -> {put_in(acc, current_path, []), current}
+            val -> {acc, current}
           end
         end)
-        Keyword.merge(result, children)
-      end) |> IO.inspect
-
-      data
-
-      update_complex_acc(mapping, [], translations, data)
-    end)
-
-    {mappings, complex}
-  end
-
-  defp update_complex_acc([], result, _, _), do: result
-  defp update_complex_acc([{from_key, map} | mapping], result, translations, data) do
-    to_key             = String.to_atom(Keyword.get(map, :to) <> ".*")
-    [app_name | path]  = Keyword.get(map, :to) |> String.split(".") |> Enum.map(&String.to_atom/1)
-    IO.inspect {:app, app_name, path, from_key, to_key, data, result}
-    built = build_complex(mapping, translations, data, from_key, to_key)
-            |> List.flatten
-            |> Enum.sort_by(fn {k, _} -> k end)
-    result = case result do
-      [] ->
-        IO.inspect {app_name, path, built}
-        update_in!([], [app_name | path], built)
-      _  ->
-        update_in!(result, [app_name | path], built)
-    end
-    update_complex_acc(mapping, result, translations, data)
-  end
-
-  defp delete_complex(mappings, []), do: mappings
-  defp delete_complex(collect_mappings, [{key, maps} | mappings]) do
-    case Regex.run(~r/\.\*/, key |> to_string) do
-      nil -> delete_complex([{key,maps} | collect_mappings], mappings)
-      _ ->   delete_complex(collect_mappings, mappings)
-    end
-  end
-
-  defp get_complex(complex, []) do
-    # Sort by path length so that parent keys are created before children
-    complex |> Enum.sort_by(fn {k, _} -> byte_size("#{k}") end)
-  end
-  defp get_complex(complex, [{key, _} = mapping | mappings]) do
-    case Regex.run(~r/\.\*/, to_string(key)) do
-      nil ->
-        get_complex(complex, mappings)
-      _ ->
-        mappings       = List.keydelete(mappings, key, 0)
-        [pattern | _]  = String.split(to_string(key), ".")
-        pattern_length = byte_size(pattern)
-
-        result = Enum.filter(mappings,
-          fn {k, _}  ->
-            case :re.run(Atom.to_string(k), to_string(key)) do
-              :nomatch -> false
-              {:match, [{0, l}]} when l < pattern_length -> false
-              _ -> true
-            end
-          end)
-
-        case result do
-          [] -> get_complex(List.flatten([{key, [mapping]} | complex]), mappings)
-          _  -> get_complex(List.flatten([{key, result} | complex]), mappings)
-        end
-    end
-  end
-
-  defp get_in_complex(name, normalized_conf, [key]) do
-    res = Enum.filter(normalized_conf,
-      fn {complex_key, _} ->
-        {_, pattern} = Regex.compile(Atom.to_string(key))
-        case Regex.run(pattern, Atom.to_string(complex_key)) do
-          nil -> false
-          _   -> true
-        end
+        put_in(acc, key, value)
       end)
 
-    res = Enum.filter(res, fn {complex_key, _} ->
-      case complex_key do
-        ^key ->
-          true
-        _ ->
-          {_, wildcard_name} = get_name_under_wildcard(key, complex_key)
-          wildcard_name == name
-      end
-    end)
-
-    case res do
-      []         -> []
-      [{_, val}] -> val
-      values when is_list(values) -> []
+    catch
+      err ->
+        Conform.Utils.error("Error thrown when constructing configuration: #{Macro.to_string(err)}")
+        exit(1)
+    after
+      :ets.delete(table_id)
     end
   end
 
-  defp get_complex_names(result, [], _), do: result |> :lists.usort
-  defp get_complex_names(result, [{pattern, _} | complex], normalized_conf) do
-    res = Enum.map(normalized_conf, fn {complex_key, _} ->
-      {_, regexp} = Regex.compile(Atom.to_string(pattern))
-      case Regex.run(regexp, Atom.to_string(complex_key)) do
-        nil -> []
-        _   -> get_name_under_wildcard(pattern, complex_key)
-      end
-    end)
-
-    get_complex_names(List.flatten([res | result]), complex, normalized_conf)
-  end
-
-  defp get_name_under_wildcard(pattern, name) do
-    pattern = String.split(Atom.to_string(pattern), ".*")
-              |> List.first
-    result = String.split(Atom.to_string(name), pattern <> ".")
-             |> List.last
-             |> String.split(".")
-             |> List.first
-    {pattern, result}
-  end
-
-  defp build_complex(mapping, translations, data, from_key, to_key) do
-    Enum.map(data, fn {field_name, data} ->
-      map = Enum.reduce(data, %{}, fn
-        {k, v}, acc ->
-          case k do
-            ^from_key -> Map.put(acc, field_name, v)
-            ^to_key   -> Map.put(acc, field_name, v)
-            _         -> Map.put(acc, k, v)
+  defp convert_types([], _), do: true
+  defp convert_types([{key, mapping}|rest], table) do
+    # Get conf item
+    select_expr = {Enum.map(key, fn '*' -> :'_'; k -> k end), :'_'}
+    case :ets.match_object(table, select_expr) do
+      # No matches
+      [] -> convert_types(rest, table)
+      # Matches requiring conversion
+      results when is_list(results) ->
+        for {conf_key, value} <- results do
+          datatype = Keyword.get(mapping, :datatype, :binary)
+          default  = Keyword.get(mapping, :default, nil)
+          parsed = case value do
+            nil -> default
+            _   -> parse_datatype(datatype, value, conf_key)
           end
+          :ets.insert(table, {conf_key, parsed})
+        end
+        convert_types(rest, table)
+    end
+  end
+
+  defp convert_complex_types([], _), do: true
+  defp convert_complex_types([{key, mapping}|rest], table) do
+    case Keyword.get(mapping, :datatype) do
+      :complex ->
+        to_key = Keyword.get(mapping, :to, key)
+        # Build complex type
+        {selected, results} = construct_complex_type(key, mapping, table)
+        # Iterate over the selected keys, deleting them from the table
+        for {variables, _, _, conf_key} <- selected do
+          # Map over to_key, applying replacements of the wildcards
+          # Get the indices of wildcards in the mapping key
+          to_key_vars = to_key
+                        |> Enum.filter(fn '*' -> true; _ -> false end)
+                        |> Enum.with_index
+          # For each wildcard, find it's corresponding match in the conf key,
+          # and iterate through `to_key` until we find the next unreplaced wildcard,
+          # replacing it with the match found.
+          to_key = Enum.reduce(to_key_vars, to_key, fn {_, index}, acc ->
+            replacement = Enum.at(variables, index)
+            {_, replaced} = List.foldr(acc, {false, []}, fn
+              '*', {false, acc} -> {true, [replacement|acc]}
+              '*', {true, acc}  -> {true, acc}
+              part, {replaced?, acc}    -> {replaced?, [part|acc]}
+            end)
+            replaced
+          end)
+          # Get the child element in the result corresponding to this key
+          path = variables |> Enum.map(&List.to_atom/1)
+          child = get_in(results, path)
+          # Insert the mapped value under the replaced key, merging with existing
+          # value if present
+          case :ets.lookup(table, to_key) do
+            []              -> :ets.insert(table, {to_key, child})
+            [{_, existing}] -> :ets.insert(table, {to_key, Keyword.merge(existing, child)})
+          end
+          :ets.delete(table, conf_key)
+        end
+        # Move to next mapping
+        convert_complex_types(rest, table)
+      complex when complex in [{:list, :complex}, [:complex]] ->
+        to_key = Keyword.get(mapping, :to, key)
+        # Get all records which match the current map_key + children
+        {selected, results} = construct_complex_type(key, mapping, table)
+        # Iterate over the selected keys, deleting them from the table
+        for {[child_key|_], _, _, conf_key} <- selected do
+          child = get_in(results, [List.to_atom(child_key)])
+          to_key = to_key ++ [child_key]
+          :ets.insert(table, {to_key, child})
+          :ets.delete(table, conf_key)
+        end
+        convert_complex_types(rest, table)
+      _ ->
+        convert_complex_types(rest, table)
+    end
+  end
+
+  defp construct_complex_type(key, mapping, table) do
+    to_key = Keyword.get(mapping, :to, key)
+    # Get all records which match the current map_key + children
+    key_parts  = key
+                 |> Enum.with_index
+                 |> Enum.map(fn {'*', i} -> {:'$#{i+1}', i}; {k, i} -> {k, nil} end)
+    variables  = key_parts
+                 |> Enum.filter(fn {_, nil} -> false; _ -> true end)
+                 |> Enum.map(fn {var, _} -> var end)
+    key_parts  = key_parts
+                 |> Enum.map(fn {part, _} -> part end)
+                 |> Enum.reverse
+    # We want to capture the subkey list, which is why we're building an inproper list here for the matchspec
+    select_key  = [:'$99' | key_parts] |> Enum.reverse
+    # Our match spec is saying: Match any records which match at least the given key, and have one or more
+    # additional elements to the key, returning a tuple of {wildcard_variables, subkey_list, value, conf_key}
+    # `wildcard_variables` contains the actual values in the conf which map to wildcards in the mapping key,
+    # `subkey_list` is a list of keys which are children of the mapping key path.
+    # `value` is the value of full conf key path
+    select_expr = [{{select_key, :'$100'}, [{:'>=', {:length, :'$99'}, 1}], [{{variables, :'$99', :'$100', select_key}}]}]
+    selected    = :ets.select(table, select_expr)
+    # Make sure the hierarchy exists for this mapping
+    results = Enum.reduce(selected, [], fn {variables, subkey, value, _}, acc ->
+      to_key = (variables ++ [subkey]) |> Enum.map(&List.to_atom/1)
+      # Fold over the key path, ensuring that each intermediate key in the path,
+      # exists in the result object.
+      {acc, _} = List.foldl(to_key, {acc, []}, fn key_part, {acc, parents} ->
+        current       = [key_part|parents]
+        current_path  = current |> Enum.reverse
+        case get_in(acc, current_path) do
+          nil -> {put_in(acc, current_path, []), current}
+          val -> {acc, current}
+        end
       end)
-      IO.inspect {:map, map}
-      IO.inspect {:from_key, from_key}
-      IO.inspect {:to_key, to_key}
-      case get_in(translations, [to_key]) do
-        fun when is_function(fun) ->
-          fun.(mapping, {field_name, map}, []) |> List.flatten
-      end
+      # Put the value for the full key path in the result
+      put_in(acc, to_key, value)
     end)
+    {selected, results}
   end
 
-  defp repath(setting_path) do
-    uc_set   = Enum.map(?A..?Z, fn i -> <<i::utf8>> end) |> Enum.into(HashSet.new)
-    setting_path
-    |> Enum.map(&Atom.to_string/1)
-    |> repath(uc_set, [], [])
-    |> List.flatten
-    |> Enum.reverse
-    |> Enum.map(&String.to_atom/1)
-  end
-
-  defp repath([], _uc_set, [], total_acc),       do: total_acc
-  defp repath([], _uc_set, this_acc, total_acc), do: [rev_join_key(this_acc)|total_acc]
-  defp repath([next|tail], uc_set, this_acc, total_acc) do
-    case Set.member?(uc_set, String.at(next, 0)) do
-      true ->
-        repath(tail, uc_set, [next|this_acc], total_acc)
-      false ->
-        repath(tail, uc_set, [], [next|[rev_join_key(this_acc)|total_acc]])
+  defp apply_translations(_mappings, [], _table), do: true
+  defp apply_translations(mappings, [{key, translation}|rest], table) when is_function(translation) do
+    # Get mapping for this translation
+    case Enum.find(mappings, fn {mapping_key, _} -> mapping_key == key end) do
+      nil     -> apply_translations(mappings, rest, table)
+      {to_key, mapping} ->
+        # Use mapping key to locate values to be translated
+        select_expr = {Enum.map(to_key, fn '*' -> :'_'; k -> k end), :'_'}
+        select_result = :ets.match_object(table, select_expr)
+        case :ets.match_object(table, select_expr) do
+          [] -> apply_translations(mappings, rest, table)
+          results when is_list(results) ->
+            # For each result, apply the translation to the value selected, and update the stored value
+            Enum.reduce(results, [], fn {result_key, value}, acc ->
+              current_key = List.last(result_key) |> List.to_atom
+              translated = case :erlang.fun_info(translation, :arity) do
+                {:arity, 2} ->
+                  translation.(mapping, {current_key, value})
+                {:arity, 3} ->
+                  translation.(mapping, {current_key, value}, acc)
+                _ ->
+                  key = Enum.map(key, &List.to_string/1) |> Enum.join(".")
+                  Conform.Utils.error("Invalid translation function arity for #{key}. Must be /2 or /3")
+                  exit(1)
+              end
+              insert_key = Enum.slice(result_key, 0, Enum.count(result_key) - 1)
+              :ets.insert(table, {insert_key, translated})
+              :ets.delete(table, result_key)
+              translated
+            end)
+        end
+        apply_translations(mappings, rest, table)
     end
   end
 
-  defp rev_join_key([]), do: []
-  defp rev_join_key(key_frags) when is_list(key_frags) do
-    key_frags |> Enum.reverse |> Enum.join(".")
-  end
-
-  defp update_in!(coll, key_path, value), do: update_in!(coll, key_path, value, [])
-  defp update_in!(coll, [], value, path), do: put_in(coll, path, value)
-  defp update_in!(coll, [key|rest], value, acc) do
-    path = acc ++ [key]
-    case get_in(coll, path) do
-      nil -> put_in(coll, path, []) |> update_in!(rest, value, path)
-      _   -> update_in!(coll, rest, value, path)
-    end
-  end
 
   # Add a .conf-style comment to the given line
   defp add_comment(line), do: "# #{line}"
@@ -545,23 +454,6 @@ defmodule Conform.Translate do
 
   defp to_comment(str) do
     String.split(str, "\n", trim: true) |> Enum.map(&add_comment/1) |> Enum.join("\n")
-  end
-
-  defp custom_parsed_value(mod, key, normalized_conf, default_value) do
-    case get_in(normalized_conf, [key]) do
-      nil -> default_value
-      val ->
-        case mod.parse_datatype(key, val) do
-          {:ok, result}     -> result
-          {:error, _} = err -> err
-        end
-    end
-  end
-
-  defp translate_custom_type(mod, mapping, key, normalized_conf, parsed_value, result, app_name, setting_path) do
-    parsed_value = custom_parsed_value(mod, key, normalized_conf, parsed_value)
-    accumulator  = get_in(result, [app_name | setting_path])
-    mod.translate(mapping, parsed_value, accumulator)
   end
 
   defp is_custom_type?(datatype) do
